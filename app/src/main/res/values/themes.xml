@@ -1,3 +1,14 @@
 <resources>
-    <style name="Theme.OpenClawTelegramHandsfree" parent="Theme.Material3.DayNight.NoActionBar" />
+    <style name="Theme.OpenClawTelegramHandsfree" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/clawsfree_primary</item>
+        <item name="colorOnPrimary">@android:color/white</item>
+        <item name="colorSecondary">@color/clawsfree_accent</item>
+        <item name="colorTertiary">@color/clawsfree_accent</item>
+        <item name="colorSurface">@color/clawsfree_surface</item>
+        <item name="colorOnSurface">@color/clawsfree_text_primary</item>
+        <item name="colorOutline">@color/clawsfree_surface_outline</item>
+        <item name="android:windowBackground">@drawable/bg_main_gradient</item>
+        <item name="android:statusBarColor">@color/clawsfree_background</item>
+        <item name="android:navigationBarColor">@color/clawsfree_background</item>
+    </style>
 </resources>

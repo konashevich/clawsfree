@@ -2,8 +2,6 @@ package io.openclaw.telegramhandsfree
 
 import android.app.Activity
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import androidx.core.content.ContextCompat
 import io.openclaw.telegramhandsfree.voice.ClawsfreeForegroundService
@@ -15,35 +13,22 @@ import io.openclaw.telegramhandsfree.voice.ClawsfreeForegroundService
  * starts recording via the foreground service and finishes itself.
  */
 class AssistActivity : Activity() {
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         Log.i(TAG, "AssistActivity launched with action=${intent?.action}")
 
-        // Keep this top activity alive briefly while recording starts so Android
-        // still considers the app in an eligible foreground state for
-        // microphone foreground-service promotion.
+        // Fire-and-forget: tell the foreground service to start recording.
+        // The VoiceInteractionSession.onShow() does the same thing so this is
+        // a safe no-op if recording already started through that path.
         ContextCompat.startForegroundService(
             this,
-            ClawsfreeForegroundService.createIntent(this, ClawsfreeForegroundService.ACTION_ENSURE_RUNNING)
+            ClawsfreeForegroundService.createIntent(this, ClawsfreeForegroundService.ACTION_START_RECORDING)
         )
 
-        mainHandler.postDelayed(
-            {
-                ContextCompat.startForegroundService(
-                    this,
-                    ClawsfreeForegroundService.createIntent(this, ClawsfreeForegroundService.ACTION_TOGGLE_RECORDING)
-                )
-            },
-            900L
-        )
-
-        mainHandler.postDelayed(
-            { finish() },
-            2600L
-        )
+        // Finish immediately — Theme.NoDisplay requires finish() inside onCreate.
+        finish()
     }
 
     companion object {

@@ -1,0 +1,21 @@
+<resources>
+    <color name="clawsfree_primary">#114B5F</color>
+    <color name="clawsfree_accent">#D96E30</color>
+    <color name="clawsfree_background">#F4F0E7</color>
+    <color name="clawsfree_background_warm">#F8F4EB</color>
+    <color name="clawsfree_surface">#FFFCF7</color>
+    <color name="clawsfree_surface_outline">#DDD4C8</color>
+    <color name="clawsfree_text_primary">#13232A</color>
+    <color name="clawsfree_text_muted">#66757D</color>
+    <color name="clawsfree_record_idle">#184E63</color>
+    <color name="clawsfree_record_recording">#C54F3D</color>
+    <color name="clawsfree_record_sending">#6E5B95</color>
+    <color name="clawsfree_record_outline">#F3D8C2</color>
+    <color name="clawsfree_record_text_muted">#E5F0F5</color>
+    <color name="clawsfree_success_bg">#DCEEDF</color>
+    <color name="clawsfree_success_text">#2C6B3F</color>
+    <color name="clawsfree_warning_bg">#F2E6C9</color>
+    <color name="clawsfree_warning_text">#8C6220</color>
+    <color name="clawsfree_info_bg">#DCE7EE</color>
+    <color name="clawsfree_info_text">#2C5266</color>
+</resources>

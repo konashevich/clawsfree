@@ -104,10 +104,16 @@ class ClawsfreeForegroundService : Service() {
                     return@startMonitoring
                 }
 
-                playbackManager.playFile(incomingVoice.file)
-                awaitingReplyPlayback = false
-                pendingReplyFile = null
-                Log.i(TAG, "Played incoming reply media and cleared awaited-reply state")
+                // Dispatch to main thread — playbackManager handles the thread switch
+                // internally but we also clear state on the main thread for safety.
+                mainHandler.post {
+                    if (!recorder.isRecording) {
+                        playbackManager.playFile(incomingVoice.file)
+                        awaitingReplyPlayback = false
+                        pendingReplyFile = null
+                        Log.i(TAG, "Played incoming reply media and cleared awaited-reply state")
+                    }
+                }
             }
         }
 
@@ -228,10 +234,12 @@ class ClawsfreeForegroundService : Service() {
 
             pendingReplyFile?.let { queuedFile ->
                 if (!recorder.isRecording) {
-                    playbackManager.playFile(queuedFile)
-                    awaitingReplyPlayback = false
-                    pendingReplyFile = null
-                    Log.i(TAG, "Played queued incoming media after send completion")
+                    mainHandler.post {
+                        playbackManager.playFile(queuedFile)
+                        awaitingReplyPlayback = false
+                        pendingReplyFile = null
+                        Log.i(TAG, "Played queued incoming media after send completion")
+                    }
                 }
             }
 
@@ -406,7 +414,7 @@ class ClawsfreeForegroundService : Service() {
         val text = if (isRecording) R.string.notif_text_recording else R.string.notif_text_idle
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setSmallIcon(R.drawable.ic_clawsfree_status)
             .setContentTitle(getString(title))
             .setContentText(getString(text))
             .setOngoing(true)
