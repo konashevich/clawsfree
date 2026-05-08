@@ -18,7 +18,6 @@ import android.media.AudioTrack
 import android.os.SystemClock
 import android.media.AudioManager
 import android.util.Log
-import android.media.ToneGenerator
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
@@ -41,6 +40,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.io.File
+import kotlin.math.PI
+import kotlin.math.sin
 
 class ClawsfreeForegroundService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -58,6 +59,9 @@ class ClawsfreeForegroundService : Service() {
     private var mediaKeyKeepAliveTrack: AudioTrack? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var lastHandledMediaKeyAtMs: Long = 0L
+    private var mediaSessionDownAtMs: Long = 0L
+    private var mediaSessionLongPressTriggered: Boolean = false
+    private var recordingStartPending: Boolean = false
     private var awaitingReplyPlayback: Boolean = false
     private var pendingReplyFile: File? = null
 
@@ -84,8 +88,6 @@ class ClawsfreeForegroundService : Service() {
             return
         }
 
-        setupMediaSession()
-
         // Keep CPU awake while service runs (screen off during driving)
         wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "openclaw:foreground")
@@ -108,7 +110,10 @@ class ClawsfreeForegroundService : Service() {
                 // internally but we also clear state on the main thread for safety.
                 mainHandler.post {
                     if (!recorder.isRecording) {
-                        playbackManager.playFile(incomingVoice.file)
+                        activateMediaButtonSession()
+                        playbackManager.playFile(incomingVoice.file) {
+                            releaseMediaButtonSession(abandonFocus = false)
+                        }
                         awaitingReplyPlayback = false
                         pendingReplyFile = null
                         Log.i(TAG, "Played incoming reply media and cleared awaited-reply state")
@@ -144,6 +149,7 @@ class ClawsfreeForegroundService : Service() {
         when (intent?.action) {
             ACTION_START_RECORDING -> startRecording()
             ACTION_STOP_IF_RECORDING -> stopRecordingAndSend()
+            ACTION_CANCEL_RECORDING -> cancelRecording()
             ACTION_TOGGLE_RECORDING -> {
                 if (recorder.isRecording) stopRecordingAndSend() else startRecording()
             }
@@ -187,7 +193,7 @@ class ClawsfreeForegroundService : Service() {
 
     private fun startRecording() {
         if (!coreReady) return
-        if (recorder.isRecording) return
+        if (isRecordingOrPending()) return
         if (!ClawsfreeConfig.canStartRecording(this)) {
             Log.i(TAG, "Ignoring startRecording because setup is not completed")
             broadcastActivity("idle")
@@ -206,13 +212,26 @@ class ClawsfreeForegroundService : Service() {
 
         val useBt = ClawsfreeConfig.USE_BLUETOOTH_MIC
         recorder.useBluetoothSource = useBt
-        if (useBt) startBluetoothSco()
         requestAudioFocus()
-        startMediaKeyKeepAlivePlayback()
+        activateMediaButtonSession()
         playbackManager.stop()
 
-        beepStartRecording()
-        recorder.start()
+        beepStartRecording {
+            if (useBt) startBluetoothSco()
+        }
+        if (!useBt) {
+            recorder.start()
+        } else {
+            // Bluetooth starts after the media-routed confirmation beep so the
+            // sound stays on car speakers before SCO takes over the microphone.
+            recordingStartPending = true
+            mainHandler.postDelayed({
+                if (recordingStartPending && !recorder.isRecording) {
+                    recordingStartPending = false
+                    recorder.start()
+                }
+            }, START_RECORDING_AFTER_BEEP_MS)
+        }
         updatePlaybackState(isRecording = true)
         updateNotification(isRecording = true)
         broadcastActivity("recording")
@@ -220,11 +239,14 @@ class ClawsfreeForegroundService : Service() {
 
     private fun stopRecordingAndSend() {
         if (!coreReady) return
+        if (recordingStartPending) {
+            cancelPendingRecordingStart()
+            return
+        }
         val recordingFile = recorder.stop() ?: return
-        stopMediaKeyKeepAlivePlayback()
-        abandonAudioFocus()
         beepStopRecording()
         stopBluetoothSco()
+        releaseMediaButtonSession(abandonFocus = true)
         try {
             startInForeground(isRecording = false)
         } catch (e: Exception) {
@@ -243,7 +265,10 @@ class ClawsfreeForegroundService : Service() {
             pendingReplyFile?.let { queuedFile ->
                 if (!recorder.isRecording) {
                     mainHandler.post {
-                        playbackManager.playFile(queuedFile)
+                        activateMediaButtonSession()
+                        playbackManager.playFile(queuedFile) {
+                            releaseMediaButtonSession(abandonFocus = false)
+                        }
                         awaitingReplyPlayback = false
                         pendingReplyFile = null
                         Log.i(TAG, "Played queued incoming media after send completion")
@@ -255,6 +280,32 @@ class ClawsfreeForegroundService : Service() {
             // After a pause, go back to idle
             mainHandler.postDelayed({ broadcastActivity("idle") }, 2000)
         }
+    }
+
+    private fun cancelRecording() {
+        if (!coreReady) return
+        if (recordingStartPending) {
+            cancelPendingRecordingStart()
+            broadcastActivity("cancelled")
+            mainHandler.postDelayed({ broadcastActivity("idle") }, 1200)
+            return
+        }
+        val recordingFile = recorder.stop() ?: return
+        stopBluetoothSco()
+        releaseMediaButtonSession(abandonFocus = true)
+        recordingFile.delete()
+        awaitingReplyPlayback = false
+        pendingReplyFile = null
+        try {
+            startInForeground(isRecording = false)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to switch service back to idle foreground mode after cancel: ${e.message}")
+        }
+        updatePlaybackState(isRecording = false)
+        updateNotification(isRecording = false)
+        broadcastActivity("cancelled")
+        mainHandler.postDelayed({ broadcastActivity("idle") }, 1200)
+        Log.i(TAG, "Recording cancelled and discarded")
     }
 
     private fun startBluetoothSco() {
@@ -279,18 +330,28 @@ class ClawsfreeForegroundService : Service() {
         }
     }
 
-    /** Single rising beep — "recording started" */
-    private fun beepStartRecording() {
-        val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-        tg.startTone(ToneGenerator.TONE_PROP_BEEP, 200)
-        mainHandler.postDelayed({ tg.release() }, 300)
+    /** App-generated double beep — "recording started" */
+    private fun beepStartRecording(onFirstGap: (() -> Unit)? = null) {
+        playBeepPattern(
+            listOf(
+                BeepTone(frequencyHz = 880.0, durationMs = 95, volume = 0.70f),
+                BeepTone(frequencyHz = 0.0, durationMs = 55, volume = 0f),
+                BeepTone(frequencyHz = 1320.0, durationMs = 115, volume = 0.70f)
+            ),
+            onMarker = onFirstGap,
+            markerDelayMs = 120L
+        )
     }
 
-    /** Double falling beep — "recording stopped, sending" */
+    /** App-generated falling beep — "recording stopped, sending" */
     private fun beepStopRecording() {
-        val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-        tg.startTone(ToneGenerator.TONE_PROP_ACK, 300)
-        mainHandler.postDelayed({ tg.release() }, 400)
+        playBeepPattern(
+            listOf(
+                BeepTone(frequencyHz = 1040.0, durationMs = 90, volume = 0.65f),
+                BeepTone(frequencyHz = 0.0, durationMs = 45, volume = 0f),
+                BeepTone(frequencyHz = 660.0, durationMs = 115, volume = 0.65f)
+            )
+        )
     }
 
     /**
@@ -298,12 +359,11 @@ class ClawsfreeForegroundService : Service() {
      * events on Android 8.0+. The static BroadcastReceiver approach stopped
      * working because the system delivers MEDIA_BUTTON to the active MediaSession.
      *
-     * Short press routes to onPlay/onPause/onStop on many BT headsets.
-     * Long press is intercepted by the OS and triggers the assistant slot.
+     * Long press usually routes through the assistant slot. If a device sends
+     * raw repeated media-key events instead, this session starts only after the
+     * same long-press threshold. Short press while idle is intentionally ignored.
      */
     private fun setupMediaSession() {
-        registerMediaButtonReceiver()
-
         val mediaButtonIntent = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
             setClass(this@ClawsfreeForegroundService, MediaButtonReceiver::class.java)
             setPackage(packageName)
@@ -332,44 +392,93 @@ class ClawsfreeForegroundService : Service() {
 
                     if (!isMediaButtonKey(event)) return super.onMediaButtonEvent(mediaButtonIntent)
 
-                    if (event.action != KeyEvent.ACTION_UP) return true
-
-                    val now = SystemClock.elapsedRealtime()
-                    if (now - lastHandledMediaKeyAtMs < 200L) {
-                        return true
+                    return when (event.action) {
+                        KeyEvent.ACTION_DOWN -> {
+                            handleMediaSessionKeyDown(event)
+                            true
+                        }
+                        KeyEvent.ACTION_UP -> {
+                            handleMediaSessionKeyUp(event)
+                            true
+                        }
+                        else -> true
                     }
-                    lastHandledMediaKeyAtMs = now
-
-                    // Any media button press while recording → stop and send
-                    if (recorder.isRecording) {
-                        Log.i(TAG, "MediaButton UP while recording → stop+send")
-                        stopRecordingAndSend()
-                        return true
-                    }
-                    // Any media button press while idle → start recording
-                    if (!recorder.isRecording) {
-                        Log.i(TAG, "MediaButton UP while idle → start recording")
-                        startRecording()
-                        return true
-                    }
-                    return true
                 }
 
-                // Many BT headsets route short press through these callbacks
-                // instead of onMediaButtonEvent
+                // Some BT devices send transport callbacks without press duration.
+                // While idle, ignore them so connect/resume PLAY cannot start recording.
                 override fun onPlay() {
-                    Log.i(TAG, "MediaSession.onPlay → toggle")
-                    if (recorder.isRecording) stopRecordingAndSend() else startRecording()
+                    if (isRecordingOrPending()) {
+                        Log.i(TAG, "MediaSession.onPlay while recording -> stop+send")
+                        stopRecordingAndSend()
+                    } else {
+                        Log.i(TAG, "MediaSession.onPlay while idle ignored")
+                    }
                 }
 
                 override fun onPause() {
-                    Log.i(TAG, "MediaSession.onPause → stop if recording")
-                    if (recorder.isRecording) stopRecordingAndSend()
+                    Log.i(TAG, "MediaSession.onPause -> stop if recording")
+                    if (isRecordingOrPending()) stopRecordingAndSend()
                 }
 
                 override fun onStop() {
-                    Log.i(TAG, "MediaSession.onStop → stop if recording")
-                    if (recorder.isRecording) stopRecordingAndSend()
+                    Log.i(TAG, "MediaSession.onStop -> stop if recording")
+                    if (isRecordingOrPending()) stopRecordingAndSend()
+                }
+
+                private fun handleMediaSessionKeyDown(event: KeyEvent) {
+                    val eventAtMs = eventTimeOrNow(event)
+                    if (event.repeatCount == 0) {
+                        mediaSessionDownAtMs = eventAtMs
+                        mediaSessionLongPressTriggered = false
+                        return
+                    }
+
+                    val isLongPress = eventAtMs - mediaSessionDownAtMs >= MEDIA_LONG_PRESS_MS
+                    if (!recorder.isRecording && !mediaSessionLongPressTriggered && isLongPress) {
+                        mediaSessionLongPressTriggered = true
+                        Log.i(TAG, "MediaButton long press while idle -> start recording")
+                        startRecording()
+                    }
+                }
+
+                private fun handleMediaSessionKeyUp(event: KeyEvent) {
+                    val eventAtMs = eventTimeOrNow(event)
+                    val pressDuration = if (mediaSessionDownAtMs > 0L) eventAtMs - mediaSessionDownAtMs else 0L
+                    val longPressAlreadyHandled = mediaSessionLongPressTriggered
+                    val isLongPress = longPressAlreadyHandled || pressDuration >= MEDIA_LONG_PRESS_MS
+
+                    mediaSessionDownAtMs = 0L
+                    mediaSessionLongPressTriggered = false
+
+                    if (longPressAlreadyHandled) {
+                        Log.i(TAG, "MediaButton UP after long-press start ignored")
+                        return
+                    }
+
+                    if (isMediaKeyDebounced()) return
+
+                    if (isRecordingOrPending()) {
+                        Log.i(TAG, "MediaButton UP while recording -> stop+send")
+                        stopRecordingAndSend()
+                        return
+                    }
+
+                    if (isLongPress) {
+                        Log.i(TAG, "MediaButton long press release while idle -> start recording")
+                        startRecording()
+                    } else {
+                        Log.i(TAG, "MediaButton short press while idle ignored")
+                    }
+                }
+
+                private fun isMediaKeyDebounced(): Boolean {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastHandledMediaKeyAtMs < MEDIA_KEY_DEBOUNCE_MS) {
+                        return true
+                    }
+                    lastHandledMediaKeyAtMs = now
+                    return false
                 }
 
                 private fun isMediaButtonKey(event: KeyEvent): Boolean {
@@ -377,13 +486,21 @@ class ClawsfreeForegroundService : Service() {
                         event.keyCode == KeyEvent.KEYCODE_HEADSETHOOK ||
                         event.keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
                         event.keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE ||
-                        event.keyCode == KeyEvent.KEYCODE_MEDIA_STOP
+                        event.keyCode == KeyEvent.KEYCODE_MEDIA_STOP ||
+                        event.keyCode == KeyEvent.KEYCODE_MEDIA_RECORD ||
+                        event.keyCode == KeyEvent.KEYCODE_VOICE_ASSIST ||
+                        event.keyCode == KeyEvent.KEYCODE_ASSIST
+                }
+
+                private fun eventTimeOrNow(event: KeyEvent): Long {
+                    return if (event.eventTime > 0L) event.eventTime else SystemClock.elapsedRealtime()
                 }
             })
 
-            // Must be active + have a playback state to receive media button events
-            updatePlaybackState(isRecording = false)
-            isActive = true
+            // Activated only while Clawsfree is recording or playing a reply so
+            // idle short presses remain available to the current media app.
+            setPlaybackState(buildPlaybackState(isRecording = false))
+            isActive = false
         }
     }
 
@@ -406,15 +523,59 @@ class ClawsfreeForegroundService : Service() {
     }
 
     private fun updatePlaybackState(isRecording: Boolean) {
-        val stateValue = if (isRecording) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
-        val state = PlaybackState.Builder()
-            .setActions(
-                PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
-                    PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_STOP
-            )
+        mediaSession?.setPlaybackState(buildPlaybackState(isRecording))
+    }
+
+    private fun buildPlaybackState(isRecording: Boolean): PlaybackState {
+        val stateValue = if (isRecording) PlaybackState.STATE_PLAYING else PlaybackState.STATE_NONE
+        val actions = if (isRecording) {
+            PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or
+                PlaybackState.ACTION_PLAY_PAUSE or PlaybackState.ACTION_STOP
+        } else {
+            0L
+        }
+        return PlaybackState.Builder()
+            .setActions(actions)
             .setState(stateValue, 0, 1f, SystemClock.elapsedRealtime())
             .build()
-        mediaSession?.setPlaybackState(state)
+    }
+
+    private fun activateMediaButtonSession() {
+        if (mediaSession == null) {
+            setupMediaSession()
+        }
+        registerMediaButtonReceiver()
+        mediaSession?.isActive = true
+        startMediaKeyKeepAlivePlayback()
+        updatePlaybackState(isRecording = true)
+    }
+
+    private fun isRecordingOrPending(): Boolean {
+        return recorder.isRecording || recordingStartPending
+    }
+
+    private fun releaseMediaButtonSession(abandonFocus: Boolean) {
+        stopMediaKeyKeepAlivePlayback()
+        updatePlaybackState(isRecording = false)
+        mediaSession?.isActive = false
+        unregisterMediaButtonReceiver()
+        mediaSession?.release()
+        mediaSession = null
+        if (abandonFocus) abandonAudioFocus()
+    }
+
+    private fun cancelPendingRecordingStart() {
+        recordingStartPending = false
+        stopBluetoothSco()
+        releaseMediaButtonSession(abandonFocus = true)
+        try {
+            startInForeground(isRecording = false)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to switch service back to idle after pending recording cancel: ${e.message}")
+        }
+        updateNotification(isRecording = false)
+        broadcastActivity("idle")
+        Log.i(TAG, "Pending recording start cancelled")
     }
 
     private fun buildNotification(isRecording: Boolean): Notification {
@@ -533,6 +694,83 @@ class ClawsfreeForegroundService : Service() {
         Log.i(TAG, "Stopped silent keep-alive playback")
     }
 
+    private fun playBeepPattern(
+        tones: List<BeepTone>,
+        onMarker: (() -> Unit)? = null,
+        markerDelayMs: Long = 0L
+    ) {
+        val sampleRate = 44_100
+        val pcm = generatePcm16(tones, sampleRate)
+
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setSampleRate(sampleRate)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+            )
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .setBufferSizeInBytes(pcm.size)
+            .build()
+
+        track.write(pcm, 0, pcm.size)
+        track.play()
+
+        if (onMarker != null) {
+            mainHandler.postDelayed(onMarker, markerDelayMs)
+        }
+
+        val releaseDelayMs = tones.sumOf { it.durationMs.toLong() } + 100L
+        mainHandler.postDelayed({
+            runCatching { track.stop() }
+            runCatching { track.release() }
+        }, releaseDelayMs)
+    }
+
+    private fun generatePcm16(tones: List<BeepTone>, sampleRate: Int): ByteArray {
+        val totalSamples = tones.sumOf { tone ->
+            ((sampleRate * tone.durationMs) / 1000.0).toInt()
+        }
+        val pcm = ByteArray(totalSamples * 2)
+        var offset = 0
+
+        tones.forEach { tone ->
+            val samples = ((sampleRate * tone.durationMs) / 1000.0).toInt()
+            for (i in 0 until samples) {
+                val value = if (tone.frequencyHz <= 0.0 || tone.volume <= 0f) {
+                    0
+                } else {
+                    val envelope = fadeEnvelope(i, samples)
+                    (sin(2.0 * PI * tone.frequencyHz * i / sampleRate) *
+                        Short.MAX_VALUE *
+                        tone.volume *
+                        envelope).toInt()
+                }.coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+
+                pcm[offset++] = (value and 0xff).toByte()
+                pcm[offset++] = ((value shr 8) and 0xff).toByte()
+            }
+        }
+        return pcm
+    }
+
+    private fun fadeEnvelope(index: Int, sampleCount: Int): Double {
+        val fadeSamples = minOf(sampleCount / 4, 320)
+        if (fadeSamples <= 0) return 1.0
+        return when {
+            index < fadeSamples -> index.toDouble() / fadeSamples
+            index >= sampleCount - fadeSamples -> (sampleCount - index).toDouble() / fadeSamples
+            else -> 1.0
+        }.coerceIn(0.0, 1.0)
+    }
+
     private fun createNotificationChannel() {
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = NotificationChannel(
@@ -570,9 +808,13 @@ class ClawsfreeForegroundService : Service() {
 
     companion object {
         private const val TAG = "ClawsfreeForegroundService"
+        private const val MEDIA_LONG_PRESS_MS = 650L
+        private const val MEDIA_KEY_DEBOUNCE_MS = 200L
+        private const val START_RECORDING_AFTER_BEEP_MS = 290L
 
         const val ACTION_START_RECORDING = "io.openclaw.telegramhandsfree.action.START_RECORDING"
         const val ACTION_STOP_IF_RECORDING = "io.openclaw.telegramhandsfree.action.STOP_IF_RECORDING"
+        const val ACTION_CANCEL_RECORDING = "io.openclaw.telegramhandsfree.action.CANCEL_RECORDING"
         const val ACTION_TOGGLE_RECORDING = "io.openclaw.telegramhandsfree.action.TOGGLE_RECORDING"
         const val ACTION_ENSURE_RUNNING = "io.openclaw.telegramhandsfree.action.ENSURE_RUNNING"
         const val ACTION_BEGIN_AUTH = "io.openclaw.telegramhandsfree.action.BEGIN_AUTH"
@@ -596,4 +838,10 @@ class ClawsfreeForegroundService : Service() {
             }
         }
     }
+
+    private data class BeepTone(
+        val frequencyHz: Double,
+        val durationMs: Int,
+        val volume: Float
+    )
 }

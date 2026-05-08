@@ -30,9 +30,9 @@ class AudioPlaybackManager(private val context: Context) {
      * Play the given audio file.  Safe to call from any thread — the actual
      * MediaPlayer work is always dispatched to the main looper.
      */
-    fun playFile(file: File) {
+    fun playFile(file: File, onFinished: (() -> Unit)? = null) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
-            mainHandler.post { playFile(file) }
+            mainHandler.post { playFile(file, onFinished) }
             return
         }
         stop()
@@ -50,11 +50,13 @@ class AudioPlaybackManager(private val context: Context) {
                 setOnErrorListener { _, what, extra ->
                     Log.e(TAG, "MediaPlayer error what=$what extra=$extra path=${file.absolutePath}")
                     stop()
+                    onFinished?.invoke()
                     true
                 }
                 setOnCompletionListener {
                     Log.i(TAG, "Playback complete path=${file.absolutePath}")
                     stop()
+                    onFinished?.invoke()
                 }
                 prepare()
                 start()
@@ -63,6 +65,7 @@ class AudioPlaybackManager(private val context: Context) {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start playback: ${e.message}", e)
             stop()
+            onFinished?.invoke()
         }
     }
 

@@ -21,6 +21,10 @@ class MediaButtonReceiver : BroadcastReceiver() {
             Log.i(TAG, "Ignoring media-button start because setup is not completed")
             return
         }
+        if (action == ClawsfreeForegroundService.ACTION_STOP_IF_RECORDING && !isServiceRecording(context)) {
+            Log.i(TAG, "Ignoring media-button stop because Clawsfree is not recording")
+            return
+        }
         Log.i(TAG, "MediaButtonReceiver dispatching action=$action keyCode=${event.keyCode} keyAction=${event.action}")
 
         ContextCompat.startForegroundService(
@@ -29,10 +33,22 @@ class MediaButtonReceiver : BroadcastReceiver() {
         )
     }
 
+    private fun isServiceRecording(context: Context): Boolean {
+        return context.getSharedPreferences(
+            ClawsfreeForegroundService.PREFS_NAME,
+            Context.MODE_PRIVATE
+        ).getString(ClawsfreeForegroundService.KEY_LAST_ACTIVITY, "idle") == "recording"
+    }
+
     private fun KeyEvent.isPlayPauseLike(): Boolean {
         return keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
             keyCode == KeyEvent.KEYCODE_HEADSETHOOK ||
-            keyCode == KeyEvent.KEYCODE_MEDIA_PLAY
+            keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_STOP ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_RECORD ||
+            keyCode == KeyEvent.KEYCODE_VOICE_ASSIST ||
+            keyCode == KeyEvent.KEYCODE_ASSIST
     }
 
     private class PressState {
@@ -50,13 +66,14 @@ class MediaButtonReceiver : BroadcastReceiver() {
         }
 
         private fun onDown(event: KeyEvent): String? {
+            val eventAtMs = eventTimeOrNow(event)
             if (event.repeatCount == 0) {
-                downAtMs = event.eventTime
+                downAtMs = eventAtMs
                 longPressTriggered = false
                 return null
             }
 
-            if (!longPressTriggered && event.eventTime - downAtMs >= LONG_PRESS_MS) {
+            if (!longPressTriggered && eventAtMs - downAtMs >= LONG_PRESS_MS) {
                 longPressTriggered = true
                 return debounced(ClawsfreeForegroundService.ACTION_START_RECORDING)
             }
@@ -64,7 +81,7 @@ class MediaButtonReceiver : BroadcastReceiver() {
         }
 
         private fun onUp(event: KeyEvent): String? {
-            val pressDuration = event.eventTime - downAtMs
+            val pressDuration = eventTimeOrNow(event) - downAtMs
             downAtMs = 0L
 
             if (longPressTriggered || pressDuration >= LONG_PRESS_MS) {
@@ -86,6 +103,10 @@ class MediaButtonReceiver : BroadcastReceiver() {
             lastDispatchedAction = action
             lastDispatchAtMs = now
             return action
+        }
+
+        private fun eventTimeOrNow(event: KeyEvent): Long {
+            return if (event.eventTime > 0L) event.eventTime else SystemClock.elapsedRealtime()
         }
 
         companion object {

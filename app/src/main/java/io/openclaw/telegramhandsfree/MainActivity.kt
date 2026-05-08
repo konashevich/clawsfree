@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
@@ -107,6 +108,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var assistantHintText: TextView
     private lateinit var btnFinishSetup: Button
     private lateinit var btnRecordToggle: MaterialCardView
+    private lateinit var btnCancelRecording: Button
     private lateinit var recordButtonTitle: TextView
     private lateinit var recordButtonHint: TextView
     private lateinit var connectionPill: TextView
@@ -118,6 +120,8 @@ class MainActivity : AppCompatActivity() {
     private var currentActivityState: String = "idle"
     private var isSettingsMenuVisible: Boolean = false
     private var isBindingThemeSelection: Boolean = false
+    private var activityMediaKeyDownAtMs: Long = 0L
+    private var activityMediaLongPressTriggered: Boolean = false
 
     private val requestPermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
@@ -237,6 +241,7 @@ class MainActivity : AppCompatActivity() {
         assistantHintText = findViewById(R.id.assistant_hint_text)
         btnFinishSetup = findViewById(R.id.btn_finish_setup)
         btnRecordToggle = findViewById(R.id.btn_record_toggle)
+        btnCancelRecording = findViewById(R.id.btn_cancel_recording)
         recordButtonTitle = findViewById(R.id.record_button_title)
         recordButtonHint = findViewById(R.id.record_button_hint)
         connectionPill = findViewById(R.id.connection_pill)
@@ -318,6 +323,61 @@ class MainActivity : AppCompatActivity() {
         unregisterReceiver(statusReceiver)
     }
 
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (!isHandsfreeTriggerKey(keyCode) || event == null) {
+            return super.onKeyDown(keyCode, event)
+        }
+
+        if (event.repeatCount == 0) {
+            activityMediaKeyDownAtMs = activityEventTimeOrNow(event)
+            activityMediaLongPressTriggered = false
+            return true
+        }
+
+        if (!activityMediaLongPressTriggered && isActivityLongPress(event)) {
+            activityMediaLongPressTriggered = true
+            if (currentActivityState == "recording") {
+                Log.i(TAG, "Activity media long press while recording ignored until key up")
+            } else {
+                Log.i(TAG, "Activity media long press while idle -> start recording")
+                startRecordingFromTrigger()
+            }
+        }
+        return true
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (!isHandsfreeTriggerKey(keyCode) || event == null) {
+            return super.onKeyUp(keyCode, event)
+        }
+
+        val wasLongPressTriggered = activityMediaLongPressTriggered
+    val pressDuration = if (activityMediaKeyDownAtMs > 0L) activityEventTimeOrNow(event) - activityMediaKeyDownAtMs else 0L
+        val isLongPress = wasLongPressTriggered || pressDuration >= ACTIVITY_MEDIA_LONG_PRESS_MS || isActivityLongPress(event)
+
+        activityMediaKeyDownAtMs = 0L
+        activityMediaLongPressTriggered = false
+
+        if (wasLongPressTriggered) {
+            Log.i(TAG, "Activity media key up after long-press start ignored")
+            return true
+        }
+
+        if (currentActivityState == "recording") {
+            Log.i(TAG, "Activity media key up while recording -> stop+send")
+            stopRecordingFromTrigger()
+            return true
+        }
+
+        if (isLongPress) {
+            Log.i(TAG, "Activity media long press release while idle -> start recording")
+            startRecordingFromTrigger()
+        } else {
+            Log.i(TAG, "Activity media short press while idle ignored")
+        }
+        return true
+    }
+
     private fun applyWindowInsets() {
         val topBarTopPadding = topBar.paddingTop
         val setupBottomPadding = setupContainer.paddingBottom
@@ -375,6 +435,7 @@ class MainActivity : AppCompatActivity() {
             false
         }
         btnRecordToggle.setOnClickListener { toggleRecording() }
+        btnCancelRecording.setOnClickListener { cancelRecording() }
     }
 
     private fun updateRecordButtonSize(availableWidth: Int) {
@@ -431,6 +492,50 @@ class MainActivity : AppCompatActivity() {
             action = ClawsfreeForegroundService.ACTION_TOGGLE_RECORDING
         }
         startService(intent)
+    }
+
+    private fun startRecordingFromTrigger() {
+        if (!ClawsfreeConfig.canStartRecording(this)) {
+            showTransientMessage(getString(R.string.activity_idle_hint_setup))
+            return
+        }
+        val intent = Intent(this, ClawsfreeForegroundService::class.java).apply {
+            action = ClawsfreeForegroundService.ACTION_START_RECORDING
+        }
+        ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun stopRecordingFromTrigger() {
+        val intent = Intent(this, ClawsfreeForegroundService::class.java).apply {
+            action = ClawsfreeForegroundService.ACTION_STOP_IF_RECORDING
+        }
+        startService(intent)
+    }
+
+    private fun cancelRecording() {
+        val intent = Intent(this, ClawsfreeForegroundService::class.java).apply {
+            action = ClawsfreeForegroundService.ACTION_CANCEL_RECORDING
+        }
+        startService(intent)
+    }
+
+    private fun isHandsfreeTriggerKey(keyCode: Int): Boolean {
+        return keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ||
+            keyCode == KeyEvent.KEYCODE_HEADSETHOOK ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_PLAY ||
+            keyCode == KeyEvent.KEYCODE_MEDIA_RECORD ||
+            keyCode == KeyEvent.KEYCODE_VOICE_ASSIST ||
+            keyCode == KeyEvent.KEYCODE_ASSIST
+    }
+
+    private fun isActivityLongPress(event: KeyEvent): Boolean {
+        return event.repeatCount > 0 &&
+            (activityEventTimeOrNow(event) - activityMediaKeyDownAtMs >= ACTIVITY_MEDIA_LONG_PRESS_MS ||
+                event.flags and KeyEvent.FLAG_LONG_PRESS != 0)
+    }
+
+    private fun activityEventTimeOrNow(event: KeyEvent): Long {
+        return if (event.eventTime > 0L) event.eventTime else android.os.SystemClock.elapsedRealtime()
     }
 
     private fun updateUiMode() {
@@ -537,6 +642,8 @@ class MainActivity : AppCompatActivity() {
         btnRecordToggle.setCardBackgroundColor(ContextCompat.getColor(this, backgroundColor))
         btnRecordToggle.alpha = if (recordingReady) 1f else 0.72f
         btnRecordToggle.isEnabled = recordingReady
+        btnCancelRecording.visibility = if (state == "recording") View.VISIBLE else View.GONE
+        btnCancelRecording.isEnabled = state == "recording"
     }
 
     private fun showTransientMessage(message: String) {
@@ -766,6 +873,12 @@ class MainActivity : AppCompatActivity() {
                 activityHintText.text = getString(R.string.activity_sent_hint)
                 getString(R.string.activity_sent)
             }
+            "cancelled" -> {
+                recordButtonTitle.text = getString(R.string.record_button_title_idle)
+                recordButtonHint.text = getString(R.string.record_button_hint_idle)
+                activityHintText.text = getString(R.string.activity_cancelled_hint)
+                getString(R.string.activity_cancelled)
+            }
             else -> {
                 val recordingReady = ClawsfreeConfig.canStartRecording(this)
                 recordButtonTitle.text = if (recordingReady) {
@@ -790,6 +903,10 @@ class MainActivity : AppCompatActivity() {
                 "sent" -> {
                     btnRecordToggle.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                     showTransientMessage(getString(R.string.activity_sent))
+                }
+                "cancelled" -> {
+                    btnCancelRecording.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    showTransientMessage(getString(R.string.activity_cancelled))
                 }
             }
         }
@@ -1192,5 +1309,6 @@ class MainActivity : AppCompatActivity() {
         private const val KEY_SETUP_COMPLETED = "setup_completed"
         private const val SETTING_ASSISTANT = "assistant"
         private const val SETTING_VOICE_INTERACTION_SERVICE = "voice_interaction_service"
+        private const val ACTIVITY_MEDIA_LONG_PRESS_MS = 650L
     }
 }

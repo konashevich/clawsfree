@@ -691,6 +691,19 @@
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_cancel_recording"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="18dp"
+                    android:text="@string/btn_cancel_recording"
+                    android:visibility="gone"
+                    app:backgroundTint="@color/clawsfree_surface"
+                    app:cornerRadius="20dp"
+                    app:strokeColor="@color/clawsfree_record_recording"
+                    app:strokeWidth="1dp"
+                    android:textColor="@color/clawsfree_record_recording" />
+
                 <TextView
                     android:id="@+id/activity_text"
                     android:layout_width="match_parent"
